@@ -1,268 +1,314 @@
-#include <stdint.h>
 #include <stdio.h>
-#include "main.h"
-#include "led.h"
+#include "cy_pdl.h"
+#include "cy_sysint.h"
+#include "cybsp.h"
+#include "mk_cpu_load.h"
+#include "mk_rtos.h"
 
-uint8_t current_task = 1;
-uint32_t g_tick_count = 0;
+/* Application constants */
+#define CY_ASSERT_FAILED        (0u)
+#define MK_MS_TO_TICKS(ms)      (((ms) * MK_RTOS_TICK_HZ) / 1000u)
+#define TASK_STACK_WORDS        (192u)
 
-typedef struct
+/* Button Interrupt Configuration */
+#define BTN_IRQ                 ioss_interrupts_gpio_3_IRQn
+#define BTN_IRQ_PRIORITY        (1u)
+#define BTN_DEBOUNCE_TICKS      (200u)   /* 200 ms */
+
+static const cy_stc_sysint_t btn_irq_cfg =
 {
-	uint32_t psp_value; //storing PSP value
-	uint32_t block_count;
-	uint8_t current_state;
-	void (*task_handler)(void);
-}TCB_t;
-TCB_t user_tasks[MAX_TASKS];
+    .intrSrc      = BTN_IRQ,
+    .intrPriority = BTN_IRQ_PRIORITY,
+};
 
+/* Below enum is used in ou Application and not for the kernel */
+typedef enum
+{
+    APP_PHASE_SUSPEND = 0u,
+    APP_PHASE_RESUME  = 1u
+} app_cycle_phase_t;
+
+/* ------------------------------------------------------------------ */
+/* UART context                                                         */
+/* ------------------------------------------------------------------ */
+static cy_stc_scb_uart_context_t g_uart_context;
+
+/* ------------------------------------------------------------------ */
+/* Task stacks (this Kernel is statically allocated, not dynamically) */
+/* ------------------------------------------------------------------ */
+static uint32_t g_task1_stack[TASK_STACK_WORDS];
+static uint32_t g_task2_stack[TASK_STACK_WORDS];
+static uint32_t g_task3_stack[TASK_STACK_WORDS];
+static uint32_t g_task4_stack[TASK_STACK_WORDS];
+static uint32_t g_supervisor_stack[TASK_STACK_WORDS];
+
+/* ------------------------------------------------------------------ */
+/* Task handles managed by the button-driven suspend/resume cycle      */
+/* ------------------------------------------------------------------ */
+static volatile mk_tcb_t *g_task1_handle = NULL;
+static volatile mk_tcb_t *g_task2_handle = NULL;
+static volatile mk_tcb_t *g_task3_handle = NULL;
+static volatile mk_tcb_t *g_task4_handle = NULL;
+
+static volatile mk_tcb_t *g_managed_handles[4] = { NULL, NULL, NULL, NULL };
+static const char *g_managed_names[4] = { "Task1", "Task2", "Task3", "Task4" };
+
+/* ------------------------------------------------------------------ */
+/* Button press events are counted in ISR and handled in supervisor    */
+/* ------------------------------------------------------------------ */
+static volatile uint32_t g_btn_pending_presses = 0u;
+static app_cycle_phase_t g_cycle_phase = APP_PHASE_SUSPEND;
+static uint8_t g_cycle_index = 0u;
+
+/* ------------------------------------------------------------------ */
+/* P3.7 GPIO Port-3 interrupt handler                                   */
+/* ------------------------------------------------------------------ */
+static void btn_gpio_isr(void)
+{
+    /* Check if pin 7 triggered the interrupt */
+    if (Cy_GPIO_GetInterruptStatus(BTN_PORT, BTN_PIN) != 0u)
+    {
+        Cy_GPIO_ClearInterrupt(BTN_PORT, BTN_PIN);
+
+        /* Software debounce using RTOS tick count */
+        static uint32_t last_press_tick = 0u;
+        uint32_t        now_tick        = mk_taskGetTickCount();
+
+        if ((now_tick - last_press_tick) >= BTN_DEBOUNCE_TICKS)
+        {
+            last_press_tick = now_tick;
+            g_btn_pending_presses++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 1: Toggle LEDs 1-3 every 2000 ms                               */
+/* ------------------------------------------------------------------ */
+static void task_uart_1(void *arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        Cy_GPIO_Inv(LED1_PORT, LED1_NUM);
+        Cy_GPIO_Inv(LED2_PORT, LED2_NUM);
+        Cy_GPIO_Inv(LED3_PORT, LED3_NUM);
+        mk_taskDelay(MK_MS_TO_TICKS(2000u));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 2: Toggle LEDs 4-6 every 1000 ms                               */
+/* ------------------------------------------------------------------ */
+static void task_uart_2(void *arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        Cy_GPIO_Inv(LED4_PORT, LED4_NUM);
+        Cy_GPIO_Inv(LED5_PORT, LED5_NUM);
+        Cy_GPIO_Inv(LED6_PORT, LED6_NUM);
+        mk_taskDelay(MK_MS_TO_TICKS(1000u));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 3: Toggle LEDs 7-9 every 1000 ms                               */
+/* ------------------------------------------------------------------ */
+static void task_uart_3(void *arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        Cy_GPIO_Inv(LED7_PORT, LED7_NUM);
+        Cy_GPIO_Inv(LED8_PORT, LED8_NUM);
+        Cy_GPIO_Inv(LED9_PORT, LED9_NUM);
+        mk_taskDelay(MK_MS_TO_TICKS(1000u));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Task 4: Toggle user LED every 500 ms                                */
+/* ------------------------------------------------------------------ */
+static void task_uart_4(void *arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        Cy_GPIO_Inv(CYBSP_USER_LED_PORT, CYBSP_USER_LED_PIN);
+        mk_taskDelay(MK_MS_TO_TICKS(500u));
+    }
+}
+
+static const char *task_state_to_str(mk_task_state_t state)
+{
+    switch (state)
+    {
+        case MK_TASK_READY:
+            return "READY";
+        case MK_TASK_BLOCKED:
+            return "BLOCKED";
+        case MK_TASK_RUNNING:
+            return "RUNNING";
+        case MK_TASK_SUSPENDED:
+            return "SUSPENDED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Supervisor task: handles button events and prints continuous status */
+/* ------------------------------------------------------------------ */
+static void task_supervisor(void *arg)
+{
+    char msg[128];
+    uint32_t last_status_tick = 0u;
+
+    (void)arg;
+
+    for (;;)
+    {
+        while (g_btn_pending_presses > 0u)
+        {
+            uint32_t irq_state;
+            uint8_t task_idx;
+            volatile mk_tcb_t *task_handle;
+
+            irq_state = Cy_SysLib_EnterCriticalSection();
+            g_btn_pending_presses--;
+            Cy_SysLib_ExitCriticalSection(irq_state);
+
+            task_idx = g_cycle_index;
+            task_handle = g_managed_handles[task_idx];
+
+            if ((g_cycle_phase == APP_PHASE_SUSPEND) && (task_handle != NULL))
+            {
+                mk_taskSuspend(task_handle);
+                snprintf(msg, sizeof(msg),
+                               "[BTN] %s Suspended\r\n",
+                               g_managed_names[task_idx]);
+                Cy_SCB_UART_PutString(CYBSP_UART_HW, msg);
+            }
+            else if ((g_cycle_phase == APP_PHASE_RESUME) && (task_handle != NULL))
+            {
+                mk_taskResume(task_handle);
+                snprintf(msg, sizeof(msg),
+                               "[BTN] %s Resumed\r\n",
+                               g_managed_names[task_idx]);
+                Cy_SCB_UART_PutString(CYBSP_UART_HW, msg);
+            }
+
+            g_cycle_index++;
+            if (g_cycle_index >= 4u)
+            {
+                g_cycle_index = 0u;
+                g_cycle_phase = (g_cycle_phase == APP_PHASE_SUSPEND) ?
+                                APP_PHASE_RESUME : APP_PHASE_SUSPEND;
+            }
+        }
+
+        /* Printing the Load status */
+        if ((mk_taskGetTickCount() - last_status_tick) >= MK_MS_TO_TICKS(1000u))
+        {
+            uint32_t load_x1000 = mk_cpuLoadGetPercentX1000();
+
+            last_status_tick = mk_taskGetTickCount();
+
+            snprintf(msg, sizeof(msg),
+                           "CPU Load: %lu.%03lu%%\r\n",
+                           (unsigned long)(load_x1000 / 1000u),
+                           (unsigned long)(load_x1000 % 1000u));
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, msg);
+
+            snprintf(msg, sizeof(msg),
+                           "Task1=%s, Task2=%s, Task3=%s, Task4=%s\r\n",
+                           task_state_to_str(mk_taskGetState(g_task1_handle)),
+                           task_state_to_str(mk_taskGetState(g_task2_handle)),
+                           task_state_to_str(mk_taskGetState(g_task3_handle)),
+                           task_state_to_str(mk_taskGetState(g_task4_handle)));
+            Cy_SCB_UART_PutString(CYBSP_UART_HW, msg);
+        }
+
+        mk_taskDelay(MK_MS_TO_TICKS(50u));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* main                                                                 */
+/* ------------------------------------------------------------------ */
 int main(void)
 {
-	enable_processor_faults(); //To know about various faults such as Busfault, Memmanagefault etc...
-	init_scheduler_stack(SCHED_STACK_START);
-	init_tasks_stack();
-	led_init_all();
-	init_systick_timer(TICK_HZ);
-	switch_sp_to_psp(); //switching from MSP to PSP
-	task1_handler();
-	for(;;);
+    cy_rslt_t  result;
+    mk_status_t mk_status;
+
+    /* Initialize board peripherals (clocks, UART, LEDs, etc.) */
+    result = cybsp_init();
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(CY_ASSERT_FAILED);
+    }
+
+    /* Configure and enable UART */
+    Cy_SCB_UART_Init(CYBSP_UART_HW, &CYBSP_UART_config, &g_uart_context);
+    Cy_SCB_UART_Enable(CYBSP_UART_HW);
+
+    /* Register and enable the Port-3 GPIO interrupt */
+    Cy_SysInt_Init(&btn_irq_cfg, btn_gpio_isr);
+    NVIC_EnableIRQ(BTN_IRQ);
+
+    /* ---- Create RTOS tasks ---- */
+    mk_kernelInit();
+
+    /* Task 1 creation */
+    mk_status = mk_taskCreate(task_uart_1, NULL, g_task1_stack, TASK_STACK_WORDS, "Task1", 2u);
+    if (mk_status != MK_OK) { CY_ASSERT(CY_ASSERT_FAILED); }
+
+    /* Store Task1 handle immediately after creation */
+    g_task1_handle = mk_taskGetHandle("Task1");
+
+    /* Task 2 creation */
+    mk_status = mk_taskCreate(task_uart_2, NULL, g_task2_stack, TASK_STACK_WORDS, "Task2", 2u);                           
+    if (mk_status != MK_OK) { CY_ASSERT(CY_ASSERT_FAILED); }
+
+    /* Store Task2 handle immediately after creation */
+    g_task2_handle = mk_taskGetHandle("Task2");
+
+    /* Task 3 creation */
+    mk_status = mk_taskCreate(task_uart_3, NULL, g_task3_stack, TASK_STACK_WORDS, "Task3", 2u);
+    if (mk_status != MK_OK) { CY_ASSERT(CY_ASSERT_FAILED); }
+
+    /* Store Task3 handle immediately after creation */
+    g_task3_handle = mk_taskGetHandle("Task3");
+
+    /* Task 4 creation */
+    mk_status = mk_taskCreate(task_uart_4, NULL, g_task4_stack, TASK_STACK_WORDS, "Task4", 2u);
+    if (mk_status != MK_OK) { CY_ASSERT(CY_ASSERT_FAILED); }
+
+    /* Store Task4 handle immediately after creation */
+    g_task4_handle = mk_taskGetHandle("Task4");
+
+    /* Store managed task handles to be used by supervisor task */
+    g_managed_handles[0] = g_task1_handle;
+    g_managed_handles[1] = g_task2_handle;
+    g_managed_handles[2] = g_task3_handle;
+    g_managed_handles[3] = g_task4_handle;
+
+    /* Supervisor task creation */
+    mk_status = mk_taskCreate(task_supervisor, NULL, g_supervisor_stack, TASK_STACK_WORDS, "Supervisor", 1u);
+    if (mk_status != MK_OK) { CY_ASSERT(CY_ASSERT_FAILED); }
+
+    __enable_irq();
+
+    Cy_SCB_UART_PutString(CYBSP_UART_HW, "mk_rtos start\r\nPress BTN (P3.7): 1-4 suspend Task1-Task4, next 1-4 resume them\r\n");
+
+    mk_kernelStart();
+
+    /* mk_kernelStart never returns in normal operation */
+    for (;;)
+    {
+    }
 }
 
-void idle_task(void)
-{
-	while(1);
-}
+/* [] END OF FILE */
 
-void task1_handler()
-{
-	while(1)
-	{
-		printf("This is task1\n");
-		led_on(LED_GREEN);
-		task_delay(1000);
-		led_off(LED_GREEN);
-		task_delay(1000);
-	}
-}
-
-void task2_handler()
-{
-	while(1)
-	{
-		printf("This is task2\n");
-		led_on(LED_ORANGE);
-		task_delay(500);
-		led_off(LED_ORANGE);
-		task_delay(500);
-	}
-}
-
-void task3_handler()
-{
-	while(1)
-	{
-		printf("This is task3\n");
-		led_on(LED_BLUE);
-		task_delay(250);
-		led_off(LED_BLUE);
-		task_delay(250);
-	}
-}
-
-void task4_handler()
-{
-	while(1)
-	{
-		printf("This is task4\n");
-		led_on(LED_RED);
-		task_delay(125);
-		led_off(LED_RED);
-		task_delay(125);
-	}
-}
-
-void init_systick_timer(uint32_t tick_hz)
-{
-	uint32_t *pSRVR = (uint32_t *)0xE000E014; //SysTick Reload  Value Register -> specifies the start value(ie)reload value to load in systick current value register.
-	uint32_t count_value = (SYSTICK_TIM_CLK/tick_hz)-1; //For 1 ms delay, count value = (1ms/(1/16000000));-1 bcoz 0 to 15999 counts 16000
-	*pSRVR &= ~(0x00FFFFFF);
-	//Loading the Systick Reload register
-	*pSRVR |= count_value;
-	uint32_t *pSCSR = (uint32_t *)0xE000E010; //Systick Control and Status Register
-	*pSCSR |= (1 << 1); //Enable Systick exception request
-	*pSCSR |= (1 << 2); //Indicates the clock source is processor clk source
-	*pSCSR |= (1 << 0); //Enabling the systick counter
-}
-
-__attribute__((naked)) void init_scheduler_stack(uint32_t sched_top_of_stack)
-{
-	__asm volatile("MSR MSP,R0"); //Since first argument is automatically stored in R0
-	__asm volatile("BX LR"); //Link Register stores the value of return address
-}
-
-void init_tasks_stack(void)
-{
-	user_tasks[0].current_state = TASK_READY_STATE;
-	user_tasks[1].current_state = TASK_READY_STATE;
-	user_tasks[2].current_state = TASK_READY_STATE;
-	user_tasks[3].current_state = TASK_READY_STATE;
-	user_tasks[4].current_state = TASK_READY_STATE;
-	user_tasks[0].psp_value = IDLE_STACK_START;
-	user_tasks[1].psp_value = T1_STACK_START;
-	user_tasks[2].psp_value = T2_STACK_START;
-	user_tasks[3].psp_value = T3_STACK_START;
-	user_tasks[4].psp_value = T4_STACK_START;
-	user_tasks[0].task_handler = idle_task;
-	user_tasks[1].task_handler = task1_handler;
-	user_tasks[2].task_handler = task2_handler;
-	user_tasks[3].task_handler = task3_handler;
-	user_tasks[4].task_handler = task4_handler;
-	uint32_t *pPSP;
-	for(int i=0;i<MAX_TASKS;i++)
-	{
-		pPSP = (uint32_t *)user_tasks[i].psp_value;
-		pPSP--;
-		*pPSP = DUMMY_XPSR; //Set T bit as 1. In this register it is 24 bit. so value will be 0x01000000
-		pPSP--;
-		*pPSP =(uint32_t) user_tasks[i].task_handler; //This field is for PC
-		pPSP--;
-		*pPSP = 0xFFFFFFFD; //This is for LR
-		for(int j=0;j<13;j++)
-		{
-			pPSP--;
-			*pPSP = 0;
-		}
-		user_tasks[i].psp_value = (uint32_t)pPSP;
-	}
-}
-
-void enable_processor_faults(void)
-{
-	uint32_t *pSHCSR = (uint32_t *)0xE000ED24;
-	*pSHCSR |= (1 << 16); //Enabling the Mem Manage Fault
-	*pSHCSR |= (1 << 17); //Bus Fault
-	*pSHCSR |= (1 << 18); //usage Fault
-}
-
-void HardFault_Handler(void)
-{
-	printf("Exception : HardFault\n");
-	while(1);
-}
-
-void MemManage_Handler(void)
-{
-	printf("Exception : MemManageFault\n");
-	while(1);
-}
-
-void BusFault_Handler(void)
-{
-	printf("Exception: BusFault\n");
-	while(1);
-}
-
-void UsageFault_Handler(void)
-{
-	printf("Exception: UsageFault\n");
-	while(1);
-}
-
-uint32_t get_psp_value(void)
-{
-	return user_tasks[current_task].psp_value;
-}
-
-void save_psp_value(uint32_t current_psp_value)
-{
-	user_tasks[current_task].psp_value=current_psp_value;
-}
-
-void update_next_task(void)
-{
-	int state = TASK_BLOCKED_STATE;
-	for(int i=0;i<MAX_TASKS;i++)
-	{
-		current_task++;
-		current_task = current_task % MAX_TASKS;
-		state = user_tasks[current_task].current_state;
-		if(state == TASK_READY_STATE && current_task!=0)
-		{
-			break;
-		}
-	}
-	if(state!=TASK_READY_STATE)
-	current_task=0;
-}
-
-__attribute__((naked)) void switch_sp_to_psp(void)
-{
-	__asm volatile("PUSH {LR}"); //Saving the LR value for future reference(go back to main fun where it is actually called from)
-	__asm volatile("BL get_psp_value"); //TO come back to this fun itself use BL, If you want only go to that func use BX
-	__asm volatile ("MSR PSP,R0");
-	__asm volatile ("POP {LR}");
-	//Till now it only uses MSP as a stack pointer. Now only we are going to change it
-	__asm volatile("MOV R0,#0x02");
-	__asm volatile("MSR CONTROL,R0"); //Changing the setting of control registers to change to psp
-	__asm volatile("BX LR");
-}
-
-void schedule(void)
-{
-	uint32_t *pICSR = (uint32_t *)0xE000ED04;
-	*pICSR |= (1<<28); //Pending the PendSV Exception
-}
-
-void task_delay(uint32_t tick_count)
-{
-	//Disable Interrupt
-	INTERRUPT_DISABLE(); //By using PRIMASK register.Priority Mask Reg
-	if(current_task)
-	{
-		user_tasks[current_task].block_count = g_tick_count + tick_count;
-		user_tasks[current_task].current_state = TASK_BLOCKED_STATE;
-		schedule();
-	}
-	//Enable Interrupt
-	INTERRUPT_ENABLE();
-}
-
-__attribute__((naked)) void PendSV_Handler(void)
-{
-	__asm volatile ("MRS R0,PSP");
-	__asm volatile ("STMDB R0!,{R4-R11}"); //Instruction to store value of registers from R4 to R11[Data Movement from Register to Memory]
-	__asm volatile("PUSH {LR}"); //As we are going to use BL instr
-	__asm volatile("BL save_psp_value");
-	__asm volatile("BL update_next_task");
-	__asm volatile("BL get_psp_value");
-	__asm volatile ("LDMIA R0!,{R4-R11}");
-	__asm volatile ("MSR PSP,R0");
-	__asm volatile("POP {LR}");
-	__asm volatile("BX LR"); //As it is naked fun, we should manually made it to return back to the place where it is called from
-}
-
-void update_global_tick_count(void)
-{
-	g_tick_count++;
-}
-
-void unblock_tasks(void)
-{
-	for(int i=1;i<MAX_TASKS;i++)
-	{
-		if(user_tasks[i].current_state != TASK_READY_STATE)
-		{
-			if(user_tasks[i].block_count == g_tick_count)
-			{
-				user_tasks[i].current_state = TASK_READY_STATE;
-			}
-		}
-	}
-}
-
-void SysTick_Handler(void) //for pending the pendSV
-{
-	update_global_tick_count();
-	unblock_tasks();
-	uint32_t *pICSR = (uint32_t *)0xE000ED04;
-	*pICSR |= (1<<28);
-}
