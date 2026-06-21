@@ -1,4 +1,4 @@
-# MK RTOS Kernel API Flowchart
+# API Flowchart
 
 This flowchart is designed for beginners to understand when each API is used and how control moves between application code, scheduler logic, and interrupts.
 
